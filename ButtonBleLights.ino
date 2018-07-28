@@ -1,13 +1,11 @@
-#include <Adafruit_MPR121.h>
-
 /*********************************************************************
 /*********************************************************
 Author: John B Damask & Adafruit folks (via their demos)
-Created: July 27, 2017
-Purpose: Using Adafruit's capacitive touch board or Bluefruit to control NeoPixels. 
-Note: Using RGB neopixels, and MPR121 capacitive touch breakout, Feather Bluefruit 32u4.
+Created: July 27, 2018
+Purpose: Using button or Bluefruit to control NeoPixels. 
+Note: Using RGB neopixels, a button and a Feather Bluefruit 32u4.
       The Feather can both read and write from BLE. The idea is that colors can come in from
-      a central device (e.g. a Pi) or you can touch a pad connected to a sensor and send that color
+      a central device (e.g. a Pi) or you can touch the button and send a color code (state)
       to the device. Note that I've adopted the payload format from Adafruit for sending Colors 
       (as reconstructed from packetParser.cpp). Basically it's !C<red><green><blue><checksum>
 Todo: Create classes for ble, touch and pixel functions.
@@ -78,18 +76,37 @@ Todo: Create classes for ble, touch and pixel functions.
  ---------------------------------------*/
 bool neoPixelsWhite = true;  
 /*==========================================================================*/
-uint8_t output = 0;
-uint8_t len = 0;
-Adafruit_NeoPixel pixel;
-
-// You can have up to 4 on one i2c bus but one is enough for testing!
-Adafruit_MPR121 cap = Adafruit_MPR121();
+/*----------------------- 
+   BUTTON
+   Put a 2.2K resistor between data leg and 3.3v to reduce noise (YMMV...the INPUT_PULLUP may suffice)
+ -----------------------*/
+int buttonPin = 10;
 // Keeps track of the last pins touched
 // so we know when buttons are 'released'
-uint16_t lasttouched = 0;
-uint16_t currtouched = 0;
+int buttonState;
+int lastButtonState = LOW;  
+/* We'll cycle through event states on button pushes */
+uint8_t lastState = 0;
+uint8_t currentState = 1;
+uint8_t minState = 0;
+uint8_t maxState = 11;
+// Button debouncing
+// the following variables are unsigned longs because the time, measured in
+// milliseconds, will quickly become a bigger number than can be stored in an int.
+unsigned long lastDebounceTime = 0;  // the last time the output pin was toggled
+unsigned long debounceDelay = 10;    // the debounce time; increase if the output flickers 
+
+uint8_t output = 0;
+uint8_t len = 0;
+bool printOnceBle = false; // BLE initialization 
+Adafruit_NeoPixel pixel;
+
+//// Keeps track of the last pins touched
+//// so we know when buttons are 'released'
+//uint16_t lasttouched = 0;
+//uint16_t currtouched = 0;
 uint8_t state = 0;
-bool printOnceBle = false;
+
 
 /* ...hardware SPI, using SCK/MOSI/MISO hardware SPI pins and then user selected CS/IRQ/RST */
 Adafruit_BluefruitLE_SPI ble(BLUEFRUIT_SPI_CS, BLUEFRUIT_SPI_IRQ, BLUEFRUIT_SPI_RST);
@@ -110,6 +127,9 @@ extern uint8_t packetbuffer[];
 // the defined length of a color payload
 //int colorLength = 6; // From days of sending RGB colors
 int colorLength = 4;
+uint16_t colLen = 3;
+// Payload stuff
+uint8_t xsum = 0;
 uint8_t PAYLOAD_START = "!";
 uint8_t COLOR_CODE = "C";
 uint8_t BUTTON_CODE = "B";
@@ -142,9 +162,13 @@ void wipe(){
 /**************************************************************************/
 void setup()
 {
-  delay(1000);
+  //while (!Serial);  // Uncomment when connected to computer. Comment out otherwise
+  delay(500);
+  Serial.begin(115200);
   Serial.println("Setting up");
-
+  //pinMode(buttonPin, INPUT); // Set button
+  pinMode(buttonPin, INPUT_PULLUP); // Set button and use internal pullup resistor (so you don't need to add a physical one)
+  
   if (neoPixelsWhite) {
     pixel = Adafruit_NeoPixel(NUMPIXELS, PIN, NEO_GRBW + NEO_KHZ800);  
   }else{
@@ -158,13 +182,8 @@ void setup()
   }
   pixel.show();
 
-  Serial.begin(115200);
-  Serial.println(F("Adafruit Bluefruit Neopixel Color Picker Example"));
-  Serial.println(F("------------------------------------------------"));
-
   /* Initialise the module */
   Serial.print(F("Initialising the Bluefruit LE module: "));
-
   if ( !ble.begin(VERBOSE_MODE) )
   {
     error(F("Couldn't find Bluefruit, make sure it's in CoMmanD mode & check wiring?"));
@@ -195,26 +214,13 @@ void setup()
   Serial.println();
 
   ble.verbose(false);  // debug info is a little annoying after this point!
-
+  Serial.println("All set, let's go!");
   /* Wait for connection */
-  // We don't want to wait for the ble connection because we want touch to work regardless
+  // We don't want to wait for the ble connection because we want touch to work locally, regardless
   /*while (! ble.isConnected()) {
       Serial.println("Waiting for bluetooth connection");
       delay(500);
   }*/
-
-  // MPR121 board
-  // Default address is 0x5A, if tied to 3.3V its 0x5B
-  // If tied to SDA its 0x5C and if SCL then 0x5D
-  Serial.println("before cap");
-  if (!cap.begin(0x5A)) {
-    Serial.println("MPR121 not found, check wiring?");
-    //while (1);
-  }else {
-    Serial.println("MPR121 found!");    
-  }
-  Serial.println("After cap");
-
 
 
 }
@@ -247,25 +253,79 @@ void loop(void)
     len = readPacket(&ble, BLE_READPACKET_TIMEOUT);
   }
 
-  // Check touch pads input
-  currtouched = cap.touched();
- 
- // if (len == 0) return;
- // Check for bluetooth input
+//  // Check touch pads input
+//  currtouched = cap.touched();
+
+  int reading = digitalRead(buttonPin);
+  if(reading != lastButtonState){
+    // reset the debouncing timer
+    lastDebounceTime = millis();
+  }
+
+   // Check for bluetooth input
  if(len != 0) {
   Serial.println("Bluetooth event detected!");
   //delay(2000);
   bl();
- } else if(currtouched != 0 && currtouched != lasttouched) {
-  Serial.println("Touch event detected!");
-  Serial.println(currtouched);
-  touch();
- } else {
- // Serial.println("Nothing detected. :-(");
-  return;
- }
+ } else if ((millis() - lastDebounceTime) > debounceDelay) {
+    // whatever the reading is at, it's been there for longer than the debounce
+    // delay, so take it as the actual current state:
+    // if the button state has changed:
+    if(reading != buttonState){
+      buttonState = reading;
+      if(buttonState == LOW){
+        if (currentState < maxState)
+        {
+          currentState = currentState + 1;
+        }else{
+          currentState = minState;
+        }
+        Serial.print("Button pressed! New state is: ");
+        Serial.println(currentState);
+        packAndSend(); 
+      }
+    }
+  }
+  lastButtonState = reading;
+ 
+// // Check for bluetooth input
+// if(len != 0) {
+//  Serial.println("Bluetooth event detected!");
+//  //delay(2000);
+//  bl();
+// } else if(currtouched != 0 && currtouched != lasttouched) {
+//  Serial.println("Touch event detected!");
+//  Serial.println(currtouched);
+//  touch();
+// } else {
+// // Serial.println("Nothing detected. :-(");
+//  return;
+// }
 
   delay(5);
+}
+
+void packAndSend()
+{
+  Serial.println("Sending data!");
+  // Now package into a packetbuffer and write to Bluetooth
+  payload[0] = 0x21;
+  payload[1] = 0x42;
+  payload[2] = currentState;
+
+  xsum = 0;
+  //for (uint8_t i=0; i<colLen; i++) {
+  for (uint8_t i=0; i<colorLength-1; i++) {
+    xsum += payload[i];
+  }
+  xsum = ~xsum;    
+  payload[3] = xsum;  
+  for(int i = 0; i < 4; i++){
+    Serial.println(payload[i]);
+  }
+  ble.write(payload,colorLength);
+  state = currentState;
+  setLights();
 }
 
 void setLights(){
@@ -335,44 +395,44 @@ void bl(){
   setLights();
 }
 
-// Lights triggered by touch pads
-void touch(){
-   for (uint8_t i=0; i<NUMTOUCH; i++) {
-    // it if *is* touched and *wasnt* touched before, alert!
-    if ((currtouched & _BV(i)) && !(lasttouched & _BV(i)) ) {
- //     Serial.print(i); Serial.println(" touched");
-      state = i;
-    }
-        // if it *was* touched and now *isnt*, alert!
-//    if (!(currtouched & _BV(i)) && (lasttouched & _BV(i)) ) {
-////      Serial.print(i); Serial.println(" released");
+//// Lights triggered by touch pads
+//void touch(){
+//   for (uint8_t i=0; i<NUMTOUCH; i++) {
+//    // it if *is* touched and *wasnt* touched before, alert!
+//    if ((currtouched & _BV(i)) && !(lasttouched & _BV(i)) ) {
+// //     Serial.print(i); Serial.println(" touched");
+//      state = i;
 //    }
-  }
- 
- // Serial.print("Button selected: ");
-  //Serial.println(state);
-  // reset our state
-  lasttouched = currtouched;
-  // Now package into a packetbuffer and write to Bluetooth
-  payload[0] = 0x21;
-  payload[1] = 0x42;
-  payload[2] = state;
-
-  uint8_t xsum = 0;
-  uint16_t colLen = 3;
-  for (uint8_t i=0; i<colLen; i++) {
-    xsum += payload[i];
-  }
-  xsum = ~xsum;    
-  payload[3] = xsum;
-
-  /* Broadcast new state (useful if other devices are listening) */
-  ble.write(payload,colorLength);
-  //ble.readline(200);
-
-  /* Now set locally-attached lights */
-  setLights(); 
-}
+//        // if it *was* touched and now *isnt*, alert!
+////    if (!(currtouched & _BV(i)) && (lasttouched & _BV(i)) ) {
+//////      Serial.print(i); Serial.println(" released");
+////    }
+//  }
+// 
+// // Serial.print("Button selected: ");
+//  //Serial.println(state);
+//  // reset our state
+//  lasttouched = currtouched;
+//  // Now package into a packetbuffer and write to Bluetooth
+//  payload[0] = 0x21;
+//  payload[1] = 0x42;
+//  payload[2] = state;
+//
+//  uint8_t xsum = 0;
+//  uint16_t colLen = 3;
+//  for (uint8_t i=0; i<colLen; i++) {
+//    xsum += payload[i];
+//  }
+//  xsum = ~xsum;    
+//  payload[3] = xsum;
+//
+//  /* Broadcast new state (useful if other devices are listening) */
+//  ble.write(payload,colorLength);
+//  //ble.readline(200);
+//
+//  /* Now set locally-attached lights */
+//  setLights(); 
+//}
 
 
 // Fill the dots one after the other with a color
