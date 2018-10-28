@@ -1,17 +1,19 @@
 /*********************************************************************
 /*********************************************************
 Author: John B Damask & Adafruit folks (via their demos)
-Created: July 27, 2018
+Created: October 28, 2018
 Purpose: Using button or Bluefruit to control NeoPixels. 
 Note: Using RGB neopixels, a button and a Feather Bluefruit 32u4.
       The Feather can both read and write from BLE. The idea is that colors can come in from
       a central device (e.g. a Pi) or you can touch the button and send a color code (state)
       to the device. Note that I've adopted the payload format from Adafruit for sending Colors 
-      (as reconstructed from packetParser.cpp). Basically it's !C<red><green><blue><checksum>
+      (as reconstructed from packetParser.cpp). Basically it's !C<state><checksum>
+      See https://github.com/jbdamask/ButtonBleLights-OnTouchConnect
 Todo: Create classes for ble, touch and pixel functions.
 
 *********************************************************************/
 #include <Wire.h>
+#include "FastLED.h"
 
 #include <string.h>
 #include <Arduino.h>
@@ -32,39 +34,24 @@ Todo: Create classes for ble, touch and pixel functions.
     APPLICATION SETTINGS
 
     FACTORYRESET_ENABLE       Perform a factory reset when running this sketch
-   
-                              Enabling this will put your Bluefruit LE module
-                              in a 'known good' state and clear any config
-                              data set in previous sketches or projects, so
-                              running this at least once is a good idea.
-   
-                              When deploying your project, however, you will
-                              want to disable factory reset by setting this
-                              value to 0.  If you are making changes to your
-                              Bluefruit LE device via AT commands, and those
-                              changes aren't persisting across resets, this
-                              is the reason why.  Factory reset will erase
-                              the non-volatile memory where config data is
-                              stored, setting it back to factory default
-                              values.
-       
-                              Some sketches that require you to bond to a
-                              central device (HID mouse, keyboard, etc.)
-                              won't work at all with this feature enabled
-                              since the factory reset will clear all of the
-                              bonding data stored on the chip, meaning the
-                              central device won't be able to reconnect.
     PIN                       Which pin on the Arduino is connected to the NeoPixels?
     NUMPIXELS                 How many NeoPixels are attached to the Arduino?
+    FRAMES_PER_SECOND         FastLed animation
     -----------------------------------------------------------------------*/
     #define FACTORYRESET_ENABLE     1
     #define PIN                     6
-    #define NUMPIXELS               120
-    #define BRIGHTNESS              30
+    #define NUMPIXELS               140    // Using NeoPixel ring. YMMV
+    #define BRIGHTNESS              60
     #define MIN                     1
     #define MAX                     255
     #define NUMTOUCH                12
-    #define DEVICE_NAME             "AT+GAPDEVNAME=TouchLightsBle"
+    /* DEVICE_NAME determines which PiHub it connects to.
+     * If using my PiHubBleAwsIoT project, https://github.com/jbdamask/PiHubBleAwsIoT/blob/master/PiHub.cfg
+     * set the name in PiHub.cfg
+     */
+    #define DEVICE_NAME             "AT+GAPDEVNAME=TouchLightsBle" 
+    #define LED_TYPE     NEOPIXEL
+    #define FRAMES_PER_SECOND 120
 /*=========================================================================*/
 
 
@@ -74,12 +61,8 @@ Todo: Create classes for ble, touch and pixel functions.
  *  Set to true if using GRBW neopixels 
  *  (this code ignores white...but it will need to be passed if using GRBW)
  ---------------------------------------*/
-bool neoPixelsWhite = true;  
+bool neoPixelsWhite = false;
 /*==========================================================================*/
-/*----------------------- 
-   BUTTON
-   Put a 2.2K resistor between data leg and 3.3v to reduce noise (YMMV...the INPUT_PULLUP may suffice)
- -----------------------*/
 int buttonPin = 10;
 // Keeps track of the last pins touched
 // so we know when buttons are 'released'
@@ -95,18 +78,15 @@ uint8_t maxState = 11;
 // milliseconds, will quickly become a bigger number than can be stored in an int.
 unsigned long lastDebounceTime = 0;  // the last time the output pin was toggled
 unsigned long debounceDelay = 10;    // the debounce time; increase if the output flickers 
-
 uint8_t output = 0;
 uint8_t len = 0;
 bool printOnceBle = false; // BLE initialization 
-Adafruit_NeoPixel pixel;
+Adafruit_NeoPixel pixel;  // NeoPixel object
+CRGB leds[NUMPIXELS];      // FastLed object
+uint8_t gHue = 0; // rotating "base color" for FastLed
 
-//// Keeps track of the last pins touched
-//// so we know when buttons are 'released'
-//uint16_t lasttouched = 0;
-//uint16_t currtouched = 0;
 uint8_t state = 0;
-
+bool isAnimationState = false;   // If true, each loop with call the same function. Useful for animations
 
 /* ...hardware SPI, using SCK/MOSI/MISO hardware SPI pins and then user selected CS/IRQ/RST */
 Adafruit_BluefruitLE_SPI ble(BLUEFRUIT_SPI_CS, BLUEFRUIT_SPI_IRQ, BLUEFRUIT_SPI_RST);
@@ -222,6 +202,9 @@ void setup()
       delay(500);
   }*/
 
+  /* FastLed */
+  FastLED.addLeds<LED_TYPE,PIN>(leds,NUMPIXELS).setCorrection(TypicalLEDStrip);
+  FastLED.setBrightness(BRIGHTNESS);
 
 }
 
@@ -252,9 +235,6 @@ void loop(void)
     // Check bluetooth input
     len = readPacket(&ble, BLE_READPACKET_TIMEOUT);
   }
-
-//  // Check touch pads input
-//  currtouched = cap.touched();
 
   int reading = digitalRead(buttonPin);
   if(reading != lastButtonState){
@@ -287,22 +267,8 @@ void loop(void)
     }
   }
   lastButtonState = reading;
- 
-// // Check for bluetooth input
-// if(len != 0) {
-//  Serial.println("Bluetooth event detected!");
-//  //delay(2000);
-//  bl();
-// } else if(currtouched != 0 && currtouched != lasttouched) {
-//  Serial.println("Touch event detected!");
-//  Serial.println(currtouched);
-//  touch();
-// } else {
-// // Serial.println("Nothing detected. :-(");
-//  return;
-// }
-
-  delay(5);
+  if(isAnimationState){ setLights(); }
+  //delay(5);
 }
 
 void packAndSend()
@@ -332,53 +298,94 @@ void setLights(){
 
     switch (state){
       case 0:
-        setColors(255, 192, 203); // Pink        
-        wipe();
+        isAnimationState = true;
+        FastLED.show();  
+        // insert a delay to keep the framerate modest
+        FastLED.delay(500/FRAMES_PER_SECOND); 
+        // do some periodic updates
+        EVERY_N_MILLISECONDS( 20 ) { gHue++; } // slowly cycle the "base color" through the rainbow
+        confetti();
         break;        
       case 1:
+        isAnimationState = false;
         setColors(0, 128, 128); // Blue green
         wipe();
         break;      
       case 2:
-        setColors(255, 0, 0);  // Red
-        wipe();
+        isAnimationState = true;
+        FastLED.show();  
+        // insert a delay to keep the framerate modest
+        FastLED.delay(500/FRAMES_PER_SECOND); 
+        // do some periodic updates
+        EVERY_N_MILLISECONDS( 20 ) { gHue++; } // slowly cycle the "base color" through the rainbow
+        juggle();
         break;
       case 3:
-        setColors(0, 255, 0);  // Green
-        wipe();      
+        isAnimationState = true;      
+        FastLED.show();  
+        // insert a delay to keep the framerate modest
+        FastLED.delay(500/FRAMES_PER_SECOND); 
+        // do some periodic updates
+        EVERY_N_MILLISECONDS( 20 ) { gHue++; } // slowly cycle the "base color" through the rainbow
+        rainbowWithGlitter();     
         break;
       case 4: 
+        isAnimationState = false;      
         setColors(0, 255, 255); // Cyan
         wipe();
         break;
       case 5: 
-        setColors(0, 0, 255); // Blue
-        wipe();
+        isAnimationState = true;         
+        slowRainbow(5);
+        //isAnimationState = false;
+        //setColors(0, 0, 255); // Blue
+        //wipe();
         break;
       case 6:
-        setColors(255, 165, 0); // Orange
-        wipe();
+        isAnimationState = true;
+        FastLED.show();  
+        // insert a delay to keep the framerate modest
+        FastLED.delay(500/FRAMES_PER_SECOND); 
+        // do some periodic updates
+        EVERY_N_MILLISECONDS( 20 ) { gHue++; } // slowly cycle the "base color" through the rainbow
+        sinelon();
         break;
       case 7:
+        isAnimationState = false;      
         setColors(128, 0, 128); // Purple
         wipe();
         break;
       case 8:
-        setColors(255, 255, 0); // Yellow
-        wipe();
+        isAnimationState = true;
+        FastLED.show();  
+        // insert a delay to keep the framerate modest
+        FastLED.delay(500/FRAMES_PER_SECOND); 
+        // do some periodic updates
+        EVERY_N_MILLISECONDS( 20 ) { gHue++; } // slowly cycle the "base color" through the rainbow
+        bpm();
         break;
       case 9:
+        isAnimationState = false;      
         setColors(192, 214, 228); // Grey / blue
         wipe();
         break;
       case 10:   
-        rainbow(5);
+        isAnimationState = true;      
+        //rainbow(5);
+        FastLED.show();  
+        // insert a delay to keep the framerate modest        
+        FastLED.delay(1000/FRAMES_PER_SECOND); 
+        // do some periodic updates
+        EVERY_N_MILLISECONDS( 20 ) { gHue++; } // slowly cycle the "base color" through the rainbow
+        rainbow();
         break;
       case 11:   // OFF
+        isAnimationState = false;      
         setColors(0, 0, 0);
         wipe();
         break;
       default:
+        isAnimationState = false;      
         setColors(0, 0, 0);
         wipe();
 //       colorWipe(pixel.Color(0,0,0),5);
@@ -395,45 +402,6 @@ void bl(){
   setLights();
 }
 
-//// Lights triggered by touch pads
-//void touch(){
-//   for (uint8_t i=0; i<NUMTOUCH; i++) {
-//    // it if *is* touched and *wasnt* touched before, alert!
-//    if ((currtouched & _BV(i)) && !(lasttouched & _BV(i)) ) {
-// //     Serial.print(i); Serial.println(" touched");
-//      state = i;
-//    }
-//        // if it *was* touched and now *isnt*, alert!
-////    if (!(currtouched & _BV(i)) && (lasttouched & _BV(i)) ) {
-//////      Serial.print(i); Serial.println(" released");
-////    }
-//  }
-// 
-// // Serial.print("Button selected: ");
-//  //Serial.println(state);
-//  // reset our state
-//  lasttouched = currtouched;
-//  // Now package into a packetbuffer and write to Bluetooth
-//  payload[0] = 0x21;
-//  payload[1] = 0x42;
-//  payload[2] = state;
-//
-//  uint8_t xsum = 0;
-//  uint16_t colLen = 3;
-//  for (uint8_t i=0; i<colLen; i++) {
-//    xsum += payload[i];
-//  }
-//  xsum = ~xsum;    
-//  payload[3] = xsum;
-//
-//  /* Broadcast new state (useful if other devices are listening) */
-//  ble.write(payload,colorLength);
-//  //ble.readline(200);
-//
-//  /* Now set locally-attached lights */
-//  setLights(); 
-//}
-
 
 // Fill the dots one after the other with a color
 void colorWipe(uint32_t c, uint8_t wait) {
@@ -445,7 +413,65 @@ void colorWipe(uint32_t c, uint8_t wait) {
   }
 }
 
-void rainbow(uint8_t wait) {
+void rainbow() 
+{
+  // FastLED's built-in rainbow generator
+  fill_rainbow( leds, NUMPIXELS, gHue, 7);
+  Serial.println("FastLED.Rainbow called");
+}
+
+void rainbowWithGlitter() 
+{
+  // built-in FastLED rainbow, plus some random sparkly glitter
+  rainbow();
+  addGlitter(80);
+}
+
+void addGlitter( fract8 chanceOfGlitter) 
+{
+  if( random8() < chanceOfGlitter) {
+    leds[ random16(NUMPIXELS) ] += CRGB::White;
+  }
+}
+
+void confetti() 
+{
+  // random colored speckles that blink in and fade smoothly
+  fadeToBlackBy( leds, NUMPIXELS, 10);
+  int pos = random16(NUMPIXELS);
+  leds[pos] += CHSV( gHue + random8(64), 200, 255);
+}
+
+void juggle() {
+  // eight colored dots, weaving in and out of sync with each other
+  fadeToBlackBy( leds, NUMPIXELS, 20);
+  byte dothue = 0;
+  for( int i = 0; i < 8; i++) {
+    leds[beatsin16( i+7, 0, NUMPIXELS-1 )] |= CHSV(dothue, 200, 255);
+    dothue += 32;
+  }
+}
+
+void sinelon()
+{
+  // a colored dot sweeping back and forth, with fading trails
+  fadeToBlackBy( leds, NUMPIXELS, 20);
+  int pos = beatsin16( 13, 0, NUMPIXELS-1 );
+  leds[pos] += CHSV( gHue, 255, 192);
+}
+
+void bpm()
+{
+  // colored stripes pulsing at a defined Beats-Per-Minute (BPM)
+  uint8_t BeatsPerMinute = 62;
+  CRGBPalette16 palette = PartyColors_p;
+  uint8_t beat = beatsin8( BeatsPerMinute, 64, 255);
+  for( int i = 0; i < NUMPIXELS; i++) { //9948
+    leds[i] = ColorFromPalette(palette, gHue+(i*2), beat-gHue+(i*10));
+  }
+}
+
+void slowRainbow(uint8_t wait) {
   uint16_t i, j;
 
   for(j=0; j<256; j++) {
@@ -454,55 +480,6 @@ void rainbow(uint8_t wait) {
     }
     pixel.show();
     delay(wait);
-  }
-}
-
-// Slightly different, this makes the rainbow equally distributed throughout
-void rainbowCycle(uint8_t wait) {
-  uint16_t i, j;
-
-  for(j=0; j<256*5; j++) { // 5 cycles of all colors on wheel
-    for(i=0; i< pixel.numPixels(); i++) {
-      pixel.setPixelColor(i, Wheel(((i * 256 / pixel.numPixels()) + j) & 255));
-    }
-    pixel.show();
-    delay(wait);
-  }
-}
-
-//Theatre-style crawling lights.
-void theaterChase(uint32_t c, uint8_t wait) {
-  for (int j=0; j<10; j++) {  //do 10 cycles of chasing
-    for (int q=0; q < 3; q++) {
-      for (uint16_t i=0; i < pixel.numPixels(); i=i+3) {
-        pixel.setPixelColor(i+q, c);    //turn every third pixel on
-      }
-      pixel.show();
-
-      delay(wait);
-
-      for (uint16_t i=0; i < pixel.numPixels(); i=i+3) {
-        pixel.setPixelColor(i+q, 0);        //turn every third pixel off
-      }
-    }
-  }
-}
-
-//Theatre-style crawling lights with rainbow effect
-void theaterChaseRainbow(uint8_t wait) {
-  for (int j=0; j < 256; j++) {     // cycle all 256 colors in the wheel
-    for (int q=0; q < 3; q++) {
-      for (uint16_t i=0; i < pixel.numPixels(); i=i+3) {
-        pixel.setPixelColor(i+q, Wheel( (i+j) % 255));    //turn every third pixel on
-      }
-      pixel.show();
-
-      delay(wait);
-
-      for (uint16_t i=0; i < pixel.numPixels(); i=i+3) {
-        pixel.setPixelColor(i+q, 0);        //turn every third pixel off
-      }
-    }
   }
 }
 
@@ -520,3 +497,4 @@ uint32_t Wheel(byte WheelPos) {
   WheelPos -= 170;
   return pixel.Color(WheelPos * 3, 255 - WheelPos * 3, 0);
 }
+
