@@ -40,6 +40,7 @@ Todo: Create classes for ble, touch and pixel functions.
     -----------------------------------------------------------------------*/
     #define FACTORYRESET_ENABLE     1
     #define PIN                     6
+    #define BUTTON_PIN              10    
     #define NUMPIXELS               140    // Using NeoPixel ring. YMMV
     #define BRIGHTNESS              60
     #define MIN                     1
@@ -63,7 +64,6 @@ Todo: Create classes for ble, touch and pixel functions.
  ---------------------------------------*/
 bool neoPixelsWhite = false;
 /*==========================================================================*/
-int buttonPin = 10;
 // Keeps track of the last pins touched
 // so we know when buttons are 'released'
 int buttonState;
@@ -146,8 +146,8 @@ void setup()
   delay(500);
   Serial.begin(115200);
   Serial.println("Setting up");
-  //pinMode(buttonPin, INPUT); // Set button
-  pinMode(buttonPin, INPUT_PULLUP); // Set button and use internal pullup resistor (so you don't need to add a physical one)
+  //pinMode(BUTTON_PIN, INPUT); // Set button
+  pinMode(BUTTON_PIN, INPUT_PULLUP); // Set button and use internal pullup resistor (so you don't need to add a physical one)
   
   if (neoPixelsWhite) {
     pixel = Adafruit_NeoPixel(NUMPIXELS, PIN, NEO_GRBW + NEO_KHZ800);  
@@ -236,7 +236,10 @@ void loop(void)
     len = readPacket(&ble, BLE_READPACKET_TIMEOUT);
   }
 
-  int reading = digitalRead(buttonPin);
+  checkForEvent();
+
+/*
+  int reading = digitalRead(BUTTON_PIN);
   if(reading != lastButtonState){
     // reset the debouncing timer
     lastDebounceTime = millis();
@@ -266,10 +269,46 @@ void loop(void)
       }
     }
   }
-  lastButtonState = reading;
+  lastButtonState = reading;*/
   if(isAnimationState){ setLights(); }
   //delay(5);
 }
+
+
+void checkForEvent(){
+  int reading = digitalRead(BUTTON_PIN);
+  if(reading != lastButtonState){
+    // reset the debouncing timer
+    lastDebounceTime = millis();
+  }
+   // Check for bluetooth input
+ if(len != 0) {
+  Serial.println("Bluetooth event detected!");
+  //delay(2000);
+  bl();
+ } else if ((millis() - lastDebounceTime) > debounceDelay) {
+    // whatever the reading is at, it's been there for longer than the debounce
+    // delay, so take it as the actual current state:
+    // if the button state has changed:
+    if(reading != buttonState){
+      buttonState = reading;
+      if(buttonState == LOW){
+        if (currentState < maxState)
+        {
+          currentState = currentState + 1;
+        }else{
+          currentState = minState;
+        }
+        Serial.print("Button pressed! New state is: ");
+        Serial.println(currentState);
+        packAndSend(); 
+      }
+    }
+  }
+  lastButtonState = reading;
+//  if(isAnimationState){ setLights(); }  
+}
+
 
 void packAndSend()
 {
@@ -336,7 +375,7 @@ void setLights(){
         break;
       case 5: 
         isAnimationState = true;         
-        slowRainbow(5);
+        slowRainbow(50);
         //isAnimationState = false;
         //setColors(0, 0, 255); // Blue
         //wipe();
@@ -477,6 +516,7 @@ void slowRainbow(uint8_t wait) {
   for(j=0; j<256; j++) {
     for(i=0; i<pixel.numPixels(); i++) {
       pixel.setPixelColor(i, Wheel((i+j) & 255));
+      checkForEvent();
     }
     pixel.show();
     delay(wait);
